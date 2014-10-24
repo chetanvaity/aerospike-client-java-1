@@ -38,7 +38,14 @@ import com.aerospike.client.Log.Level;
 import com.aerospike.client.async.AsyncClient;
 import com.aerospike.client.async.AsyncClientPolicy;
 
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+
 public class Main implements Log.Callback {
+    
+    public static final String DB_AEROSPIKE = "aerospike";
+    public static final String DB_REDIS = "redis";
 	
 	private static final SimpleDateFormat SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 	public static List<String> keyList = null;
@@ -75,6 +82,7 @@ public class Main implements Log.Callback {
 	private boolean asyncEnabled;
 	private boolean initialize;
 	private String filepath;
+    private String db;
 
 	private AsyncClientPolicy clientPolicy = new AsyncClientPolicy();
 	private CounterStore counters = new CounterStore();
@@ -188,6 +196,10 @@ public class Main implements Log.Callback {
 		options.addOption("F", "keyFile", true, "File path to read the keys for read operation.");
 		options.addOption("KT", "keyType", true, "Type of the key(String/Integer) in the file, default is String");
 
+                options.addOption("d", "database", true, "Database to test.\n" +
+                                  DB_AEROSPIKE + "  : Run tests against aerospike\n" +
+                                  DB_REDIS     + "      : Run tests against redis");
+                
 		// parse the command line arguments
 		CommandLineParser parser = new PosixParser();
 		CommandLine line = parser.parse(options, commandLineArgs);		
@@ -481,6 +493,16 @@ public class Main implements Log.Callback {
         		this.clientPolicy.asyncTaskThreadPool = Executors.newFixedThreadPool(asyncTaskThreads);
         	}
         }
+
+        if (line.hasOption("d")) {
+            this.db = line.getOptionValue("database");
+            if (!(this.db.equals(DB_AEROSPIKE) || this.db.equals(DB_REDIS))) {
+                    throw new Exception("Unrecognized database! Not " + DB_AEROSPIKE + " or " + DB_REDIS);
+            }
+        } 
+        else {
+            this.db = DB_AEROSPIKE;
+        }
         
         if (line.hasOption("latency")) {
 			String[] latencyOpts = line.getOptionValue("latency").split(",");
@@ -498,7 +520,7 @@ public class Main implements Log.Callback {
 			args.setFixedBins();
 		}
 
-		System.out.println("Benchmark: " + this.hosts[0] + ":" + this.port 
+		System.out.println("Benchmark: " + this.db + ": " + this.hosts[0] + ":" + this.port 
 			+ ", namespace: " + args.namespace 
 			+ ", set: " + (args.setName.length() > 0? args.setName : "<empty>")
 			+ ", threads: " + this.nThreads
@@ -600,24 +622,40 @@ public class Main implements Log.Callback {
 				client.close();
 			}			
 		}
-		else {			
-			AerospikeClient client = new AerospikeClient(clientPolicy, hosts[0], port);		
-
+		else {
+                    if (DB_AEROSPIKE.equals(this.db)) {
+			AerospikeClient client = new AerospikeClient(clientPolicy, hosts[0], port);
 			try {
 				if (initialize) {
-					doInserts(client); 
+                                    doInserts(client, null); 
 				} 
 				else {
-					doRWTest(client); 
+                                    doRWTest(client); 
 				}
 			}
 			finally {
 				client.close();
+                        }
+                    } else if (DB_REDIS.equals(this.db)) {
+                        JedisPoolConfig poolConfig = new JedisPoolConfig();
+                        poolConfig.setMinIdle(10);
+                        JedisPool jedisPool = new JedisPool(poolConfig, hosts[0], port);
+			try {
+				if (initialize) {
+                                    doInserts(null, jedisPool); 
+				} /*
+				else {
+                                    doRWTest(null, redisClient); 
+                                    } */
 			}
-		}
-	}
+			finally {
+                            jedisPool.destroy();
+			}
+                    }
+                }
+        }
 
-	private void doInserts(AerospikeClient client) throws Exception {	
+                private void doInserts(AerospikeClient client, JedisPool jedisPool) throws Exception {	
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 
 		// Create N insert tasks
@@ -626,10 +664,16 @@ public class Main implements Log.Callback {
 		int keysPerTask = this.nKeys / ntasks + 1;
 
 		for (int i = 0 ; i < ntasks; i++) {
+                    if (DB_AEROSPIKE.equals(this.db)) {
 			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask); 			
 			es.execute(it);
-			start += keysPerTask;
-		}	
+                    } else if (DB_REDIS.equals(this.db)) {
+			RedisInsertTask it = new RedisInsertTask(jedisPool, args, counters, start, keysPerTask); 			
+			es.execute(it);
+                    }
+                    start += keysPerTask;
+                    
+		}
 		collectInsertStats();
 		es.shutdownNow();
 	}
