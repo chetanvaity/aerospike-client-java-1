@@ -638,15 +638,15 @@ public class Main implements Log.Callback {
                         }
                     } else if (DB_REDIS.equals(this.db)) {
                         JedisPoolConfig poolConfig = new JedisPoolConfig();
-                        poolConfig.setMinIdle(10);
+                        poolConfig.setMaxTotal(this.nThreads); // 1 connection per thread
                         JedisPool jedisPool = new JedisPool(poolConfig, hosts[0], port);
 			try {
 				if (initialize) {
                                     doInserts(null, jedisPool); 
-				} /*
+				}
 				else {
-                                    doRWTest(null, redisClient); 
-                                    } */
+                                    doRedisRWTest(jedisPool);
+				}
 			}
 			finally {
                             jedisPool.destroy();
@@ -655,7 +655,7 @@ public class Main implements Log.Callback {
                 }
         }
 
-                private void doInserts(AerospikeClient client, JedisPool jedisPool) throws Exception {	
+    private void doInserts(AerospikeClient client, JedisPool jedisPool) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 
 		// Create N insert tasks
@@ -665,10 +665,10 @@ public class Main implements Log.Callback {
 
 		for (int i = 0 ; i < ntasks; i++) {
                     if (DB_AEROSPIKE.equals(this.db)) {
-			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask); 			
+			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask);
 			es.execute(it);
                     } else if (DB_REDIS.equals(this.db)) {
-			RedisInsertTask it = new RedisInsertTask(jedisPool, args, counters, start, keysPerTask); 			
+			RedisInsertTask it = new RedisInsertTask(jedisPool, args, counters, start, keysPerTask);
 			es.execute(it);
                     }
                     start += keysPerTask;
@@ -736,13 +736,31 @@ public class Main implements Log.Callback {
 		collectRWStats(null);
 	}
 
+	private void doRedisRWTest(JedisPool jedisPool) throws Exception {
+		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
+
+		for (int i = 0 ; i < this.nThreads; i++) {
+			RedisRWTask rt;
+			if (args.validate) {
+				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));
+				int tkeys = (int) (this.nKeys*(((float) (i+1))/this.nThreads)) - (int) (this.nKeys*(((float) i)/this.nThreads));
+				rt = new RedisRWTask(jedisPool, args, counters, tstart, tkeys);
+			} else {
+				rt = new RedisRWTask(jedisPool, args, counters, this.startKey, this.nKeys);
+			}
+			es.execute(rt);
+		}
+		collectRWStats(null);
+	}
+
+
 	private void doAsyncRWTest(AsyncClient client) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 		
 		for (int i = 0 ; i < this.nThreads; i++) {
 			RWTask rt;
 			if (args.validate) {
-				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));			
+				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));
 				int tkeys = (int) (this.nKeys*(((float) (i+1))/this.nThreads)) - (int) (this.nKeys*(((float) i)/this.nThreads));
 				rt = new RWTaskAsync(client, args, counters, tstart, tkeys);
 			} else {
