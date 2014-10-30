@@ -24,20 +24,20 @@ import com.aerospike.client.Key;
 import com.aerospike.client.ResultCode;
 import com.aerospike.client.policy.WritePolicy;
 
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.Jedis;
+import redis.clients.jedis.ShardedJedisPool;
+import redis.clients.jedis.ShardedJedis;
 
 
 public class RedisInsertTask implements Runnable {
 
-    final JedisPool jedisPool;
+    final ShardedJedisPool shardedJedisPool;
     final Arguments args;
     final int keyStart;
     final int keyCount;
     final CounterStore counters;
 	
-    public RedisInsertTask(JedisPool jedisPool, Arguments args, CounterStore counters, int keyStart, int keyCount) {
-        this.jedisPool = jedisPool;
+    public RedisInsertTask(ShardedJedisPool shardedJedisPool, Arguments args, CounterStore counters, int keyStart, int keyCount) {
+        this.shardedJedisPool = shardedJedisPool;
         this.args = args;
         this.counters = counters;
         this.keyStart = keyStart;
@@ -45,9 +45,9 @@ public class RedisInsertTask implements Runnable {
     }
 
     public void run() {
-        Jedis jedisClient = jedisPool.getResource();
+        ShardedJedis shardedJedisClient = shardedJedisPool.getResource();
         try {
-            if (jedisClient == null) {
+            if (shardedJedisClient == null) {
                 System.out.println("ERROR: No client got from pool!");
                 return;
             }
@@ -61,13 +61,13 @@ public class RedisInsertTask implements Runnable {
                                         
                     if (counters.write.latency != null) {
 			long begin = System.currentTimeMillis();
-                        jedisClient.set(strKey, strValue);
+                        shardedJedisClient.set(strKey, strValue);
 			long elapsed = System.currentTimeMillis() - begin;
 			counters.write.count.getAndIncrement();			
 			counters.write.latency.add(elapsed);
                     }
                     else {
-                        jedisClient.set(strKey, strValue);
+                        shardedJedisClient.set(strKey, strValue);
 			counters.write.count.getAndIncrement();			
                     }
 
@@ -82,7 +82,7 @@ public class RedisInsertTask implements Runnable {
             ex.printStackTrace();
         }
         finally {
-            jedisPool.returnResource(jedisClient);
+            shardedJedisPool.returnResource(shardedJedisClient);
         }
     }
 

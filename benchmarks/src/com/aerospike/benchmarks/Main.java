@@ -22,6 +22,7 @@ import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -41,6 +42,8 @@ import com.aerospike.client.async.AsyncClientPolicy;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.ShardedJedisPool;
+import redis.clients.jedis.JedisShardInfo;
 
 public class Main implements Log.Callback {
     
@@ -520,7 +523,7 @@ public class Main implements Log.Callback {
 			args.setFixedBins();
 		}
 
-		System.out.println("Benchmark: " + this.db + ": " + this.hosts[0] + ":" + this.port 
+		System.out.println("Benchmark: " + this.db + ": " + Arrays.toString(this.hosts) + ":" + this.port 
 			+ ", namespace: " + args.namespace 
 			+ ", set: " + (args.setName.length() > 0? args.setName : "<empty>")
 			+ ", threads: " + this.nThreads
@@ -639,23 +642,29 @@ public class Main implements Log.Callback {
                     } else if (DB_REDIS.equals(this.db)) {
                         JedisPoolConfig poolConfig = new JedisPoolConfig();
                         poolConfig.setMaxTotal(this.nThreads); // 1 connection per thread
-                        JedisPool jedisPool = new JedisPool(poolConfig, hosts[0], port);
+                        List<JedisShardInfo> shardInfoList = new ArrayList<JedisShardInfo>();
+                        for (int i=0; i<hosts.length; i++) {
+                            // Redis shards should listen on sequentially increasing port numbers
+                            JedisShardInfo si = new JedisShardInfo(hosts[i], port+i);
+                            shardInfoList.add(si);
+                        }
+                        ShardedJedisPool shardedJedisPool = new ShardedJedisPool(poolConfig, shardInfoList);
 			try {
 				if (initialize) {
-                                    doInserts(null, jedisPool); 
+                                    doInserts(null, shardedJedisPool);
 				}
 				else {
-                                    doRedisRWTest(jedisPool);
+                                    doRedisRWTest(shardedJedisPool);
 				}
 			}
 			finally {
-                            jedisPool.destroy();
+                            shardedJedisPool.destroy();
 			}
                     }
                 }
         }
 
-    private void doInserts(AerospikeClient client, JedisPool jedisPool) throws Exception {
+    private void doInserts(AerospikeClient client, ShardedJedisPool shardedJedisPool) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 
 		// Create N insert tasks
@@ -668,7 +677,7 @@ public class Main implements Log.Callback {
 			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask);
 			es.execute(it);
                     } else if (DB_REDIS.equals(this.db)) {
-			RedisInsertTask it = new RedisInsertTask(jedisPool, args, counters, start, keysPerTask);
+			RedisInsertTask it = new RedisInsertTask(shardedJedisPool, args, counters, start, keysPerTask);
 			es.execute(it);
                     }
                     start += keysPerTask;
@@ -736,7 +745,7 @@ public class Main implements Log.Callback {
 		collectRWStats(null);
 	}
 
-	private void doRedisRWTest(JedisPool jedisPool) throws Exception {
+	private void doRedisRWTest(ShardedJedisPool shardedJedisPool) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 
 		for (int i = 0 ; i < this.nThreads; i++) {
@@ -744,9 +753,9 @@ public class Main implements Log.Callback {
 			if (args.validate) {
 				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));
 				int tkeys = (int) (this.nKeys*(((float) (i+1))/this.nThreads)) - (int) (this.nKeys*(((float) i)/this.nThreads));
-				rt = new RedisRWTask(jedisPool, args, counters, tstart, tkeys);
+				rt = new RedisRWTask(shardedJedisPool, args, counters, tstart, tkeys);
 			} else {
-				rt = new RedisRWTask(jedisPool, args, counters, this.startKey, this.nKeys);
+				rt = new RedisRWTask(shardedJedisPool, args, counters, this.startKey, this.nKeys);
 			}
 			es.execute(rt);
 		}

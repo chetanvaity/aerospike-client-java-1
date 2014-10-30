@@ -27,8 +27,8 @@ import com.aerospike.client.policy.GenerationPolicy;
 import com.aerospike.client.policy.WritePolicy;
 import com.aerospike.client.util.Util;
 
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.Jedis;
+import redis.clients.jedis.ShardedJedisPool;
+import redis.clients.jedis.ShardedJedis;
 
 
 /**
@@ -38,7 +38,7 @@ import redis.clients.jedis.Jedis;
  */
 public class RedisRWTask implements Runnable {
 
-    final JedisPool jedisPool;
+    final ShardedJedisPool shardedJedisPool;
     final Arguments args;
     final CounterStore counters;
     final Random random;
@@ -49,8 +49,8 @@ public class RedisRWTask implements Runnable {
     final int keyStart;
     final int keyCount;
 	
-    public RedisRWTask(JedisPool jedisPool, Arguments args, CounterStore counters, int keyStart, int keyCount) {
-	this.jedisPool = jedisPool;
+    public RedisRWTask(ShardedJedisPool shardedJedisPool, Arguments args, CounterStore counters, int keyStart, int keyCount) {
+	this.shardedJedisPool = shardedJedisPool;
 	this.args = args;
 	this.counters = counters;
 	this.keyStart = keyStart;
@@ -73,9 +73,9 @@ public class RedisRWTask implements Runnable {
 	    setupValidation();
 	}
 	
-	Jedis jedisClient = null;
-        jedisClient = jedisPool.getResource();
-        if (jedisClient == null) {
+	ShardedJedis shardedJedisClient = null;
+        shardedJedisClient = shardedJedisPool.getResource();
+        if (shardedJedisClient == null) {
             System.out.println("ERROR: No client got from pool!");
             return;
         }
@@ -84,7 +84,7 @@ public class RedisRWTask implements Runnable {
 	    try {
 		switch (args.workload) {
 		case READ_UPDATE:
-		    readUpdate(jedisClient);
+		    readUpdate(shardedJedisClient);
 		    break;
 					
 		case READ_MODIFY_UPDATE:
@@ -128,13 +128,13 @@ public class RedisRWTask implements Runnable {
 	}
     }
 	
-    private void readUpdate(Jedis jedisClient) {
+    private void readUpdate(ShardedJedis shardedJedisClient) {
 	if (random.nextDouble() < this.readPct) {
 	    boolean isMultiBin = random.nextDouble() < readMultiBinPct;
 			
 	    if (args.batchSize <= 1) {
 		int key = random.nextInt(keyCount);
-		doRead(jedisClient, key);
+		doRead(shardedJedisClient, key);
 	    }
 	    else {
 		doReadBatch(isMultiBin);
@@ -146,13 +146,13 @@ public class RedisRWTask implements Runnable {
 	    if (args.batchSize <= 1) {
 		// Single record write.
 		int key = random.nextInt(keyCount);
-		doWrite(jedisClient, key);
+		doWrite(shardedJedisClient, key);
 	    }
 	    else {
 		// Batch write is not supported, so write batch size one record at a time.
 		for (int i = 0; i < args.batchSize; i++) {
 		    int key = random.nextInt(keyCount);
-		    doWrite(jedisClient, key);
+		    doWrite(shardedJedisClient, key);
 		}
 	    }
 	}		
@@ -184,7 +184,7 @@ public class RedisRWTask implements Runnable {
     /**
      * Write the key at the given index
      */
-    protected void doWrite(Jedis jedisClient, int keyIdx) {
+    protected void doWrite(ShardedJedis shardedJedisClient, int keyIdx) {
 	String strKey = "" + (keyStart + keyIdx);
 	Bin[] bins = args.getBins(random, true);
 	String strValue = bins[0].value.toString();
@@ -192,12 +192,12 @@ public class RedisRWTask implements Runnable {
 	try {
 	    if (counters.write.latency != null) {
 		long begin = System.currentTimeMillis();
-		jedisClient.set(strKey, strValue);
+		shardedJedisClient.set(strKey, strValue);
 		long elapsed = System.currentTimeMillis() - begin;
 		counters.write.count.getAndIncrement();
 		counters.write.latency.add(elapsed);
 	    } else {
-		jedisClient.set(strKey, strValue);
+		shardedJedisClient.set(strKey, strValue);
 		counters.write.count.getAndIncrement();
 	    }
 	}
@@ -209,18 +209,18 @@ public class RedisRWTask implements Runnable {
     /**
      * Read the key at the given index.
      */
-    protected void doRead(Jedis jedisClient, int keyIdx) {
+    protected void doRead(ShardedJedis shardedJedisClient, int keyIdx) {
 	try {
 	    String strKey = "" + (keyStart + keyIdx);
 	    String value;
 	    if (counters.read.latency != null) {
 		long begin = System.currentTimeMillis();
-		value = jedisClient.get(strKey);
+		value = shardedJedisClient.get(strKey);
 		long elapsed = System.currentTimeMillis() - begin;
 		counters.read.latency.add(elapsed);
 	    }
 	    else {
-		value = jedisClient.get(strKey);
+		value = shardedJedisClient.get(strKey);
 	    }		
 	    if (value == null && args.reportNotFound) {
 		counters.readNotFound.getAndIncrement();	
