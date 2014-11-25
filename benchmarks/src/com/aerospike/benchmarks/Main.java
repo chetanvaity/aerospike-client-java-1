@@ -22,6 +22,7 @@ import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -39,7 +40,16 @@ import com.aerospike.client.Log.Level;
 import com.aerospike.client.async.AsyncClient;
 import com.aerospike.client.async.AsyncClientPolicy;
 
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.ShardedJedisPool;
+import redis.clients.jedis.JedisShardInfo;
+
 public class Main implements Log.Callback {
+    
+    public static final String DB_AEROSPIKE = "aerospike";
+    public static final String DB_REDIS = "redis";
 	
 	private static final SimpleDateFormat SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
 	public static List<String> keyList = null;
@@ -76,6 +86,7 @@ public class Main implements Log.Callback {
 	private boolean asyncEnabled;
 	private boolean initialize;
 	private String filepath;
+    private String db;
 
 	private AsyncClientPolicy clientPolicy = new AsyncClientPolicy();
 	private CounterStore counters = new CounterStore();
@@ -194,6 +205,10 @@ public class Main implements Log.Callback {
 		options.addOption("F", "keyFile", true, "File path to read the keys for read operation.");
 		options.addOption("KT", "keyType", true, "Type of the key(String/Integer) in the file, default is String");
 
+                options.addOption("d", "database", true, "Database to test.\n" +
+                                  DB_AEROSPIKE + "  : Run tests against aerospike\n" +
+                                  DB_REDIS     + "      : Run tests against redis");
+                
 		// parse the command line arguments
 		CommandLineParser parser = new PosixParser();
 		CommandLine line = parser.parse(options, commandLineArgs);		
@@ -509,6 +524,16 @@ public class Main implements Log.Callback {
         		this.clientPolicy.asyncTaskThreadPool = Executors.newFixedThreadPool(asyncTaskThreads);
         	}
         }
+
+        if (line.hasOption("d")) {
+            this.db = line.getOptionValue("database");
+            if (!(this.db.equals(DB_AEROSPIKE) || this.db.equals(DB_REDIS))) {
+                    throw new Exception("Unrecognized database! Not " + DB_AEROSPIKE + " or " + DB_REDIS);
+            }
+        } 
+        else {
+            this.db = DB_AEROSPIKE;
+        }
         
         if (line.hasOption("latency")) {
 			String[] latencyOpts = line.getOptionValue("latency").split(",");
@@ -526,7 +551,7 @@ public class Main implements Log.Callback {
 			args.setFixedBins();
 		}
 
-		System.out.println("Benchmark: " + this.hosts[0] + ":" + this.port 
+		System.out.println("Benchmark: " + this.db + ": " + Arrays.toString(this.hosts) + ":" + this.port 
 			+ ", namespace: " + args.namespace 
 			+ ", set: " + (args.setName.length() > 0? args.setName : "<empty>")
 			+ ", threads: " + this.nThreads
@@ -628,24 +653,46 @@ public class Main implements Log.Callback {
 				client.close();
 			}			
 		}
-		else {			
-			AerospikeClient client = new AerospikeClient(clientPolicy, hosts[0], port);		
-
+		else {
+                    if (DB_AEROSPIKE.equals(this.db)) {
+			AerospikeClient client = new AerospikeClient(clientPolicy, hosts[0], port);
 			try {
 				if (initialize) {
-					doInserts(client); 
+                                    doInserts(client, null); 
 				} 
 				else {
-					doRWTest(client); 
+                                    doRWTest(client); 
 				}
 			}
 			finally {
 				client.close();
+                        }
+                    } else if (DB_REDIS.equals(this.db)) {
+                        JedisPoolConfig poolConfig = new JedisPoolConfig();
+                        poolConfig.setMaxTotal(this.nThreads); // 1 connection per thread
+                        List<JedisShardInfo> shardInfoList = new ArrayList<JedisShardInfo>();
+                        for (int i=0; i<hosts.length; i++) {
+                            // Redis shards should listen on sequentially increasing port numbers
+                            JedisShardInfo si = new JedisShardInfo(hosts[i], port+i);
+                            shardInfoList.add(si);
+                        }
+                        ShardedJedisPool shardedJedisPool = new ShardedJedisPool(poolConfig, shardInfoList);
+			try {
+				if (initialize) {
+                                    doInserts(null, shardedJedisPool);
+				}
+				else {
+                                    doRedisRWTest(shardedJedisPool);
+				}
 			}
-		}
-	}
+			finally {
+                            shardedJedisPool.destroy();
+			}
+                    }
+                }
+        }
 
-	private void doInserts(AerospikeClient client) throws Exception {	
+    private void doInserts(AerospikeClient client, ShardedJedisPool shardedJedisPool) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 
 		// Create N insert tasks
@@ -654,10 +701,16 @@ public class Main implements Log.Callback {
 		int keysPerTask = this.nKeys / ntasks + 1;
 
 		for (int i = 0 ; i < ntasks; i++) {
-			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask); 			
+                    if (DB_AEROSPIKE.equals(this.db)) {
+			InsertTask it = new InsertTaskSync(client, args, counters, start, keysPerTask);
 			es.execute(it);
-			start += keysPerTask;
-		}	
+                    } else if (DB_REDIS.equals(this.db)) {
+			RedisInsertTask it = new RedisInsertTask(shardedJedisPool, args, counters, start, keysPerTask);
+			es.execute(it);
+                    }
+                    start += keysPerTask;
+                    
+		}
 		collectInsertStats();
 		es.shutdownNow();
 	}
@@ -720,13 +773,31 @@ public class Main implements Log.Callback {
 		collectRWStats(null);
 	}
 
+	private void doRedisRWTest(ShardedJedisPool shardedJedisPool) throws Exception {
+		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
+
+		for (int i = 0 ; i < this.nThreads; i++) {
+			RedisRWTask rt;
+			if (args.validate) {
+				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));
+				int tkeys = (int) (this.nKeys*(((float) (i+1))/this.nThreads)) - (int) (this.nKeys*(((float) i)/this.nThreads));
+				rt = new RedisRWTask(shardedJedisPool, args, counters, tstart, tkeys);
+			} else {
+				rt = new RedisRWTask(shardedJedisPool, args, counters, this.startKey, this.nKeys);
+			}
+			es.execute(rt);
+		}
+		collectRWStats(null);
+	}
+
+
 	private void doAsyncRWTest(AsyncClient client) throws Exception {
 		ExecutorService es = Executors.newFixedThreadPool(this.nThreads);
 		
 		for (int i = 0 ; i < this.nThreads; i++) {
 			RWTask rt;
 			if (args.validate) {
-				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));			
+				int tstart = this.startKey + ((int) (this.nKeys*(((float) i)/this.nThreads)));
 				int tkeys = (int) (this.nKeys*(((float) (i+1))/this.nThreads)) - (int) (this.nKeys*(((float) i)/this.nThreads));
 				rt = new RWTaskAsync(client, args, counters, tstart, tkeys);
 			} else {
